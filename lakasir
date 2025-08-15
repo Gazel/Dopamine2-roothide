@@ -1,0 +1,181 @@
+cat > install_lakasir.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# =========================
+# Lakasir one-shot installer (Ubuntu 22.04 LTS on Azure B1s)
+# - Nginx + PHP 8.1 + MariaDB
+# - Swapfile to avoid OOM on 1 GB RAM
+# - Lakasir clone, Composer install
+# - .env setup
+# - key:generate
+# - tenant migrations + seed
+# - Filament & Livewire assets
+# - Nginx vhost + UFW + cron
+# =========================
+
+# --- EDIT THESE BEFORE RUNNING (or export as envs before running) ---
+DB_NAME="${DB_NAME:-lakasir}"
+DB_USER="${DB_USER:-lakasir}"
+DB_PASS="${DB_PASS:-ChangeMe123!}"          # <<< choose a strong password
+MY_DOMAIN="${MY_DOMAIN:-}"                  # e.g. pos.example.com (leave empty to use server IP)
+# --------------------------------------------------------------------
+
+sudo apt-get update -y
+
+# Basic tools
+sudo apt-get install -y ca-certificates curl git unzip software-properties-common
+
+# Create 2G swapfile (helps composer/migrations on 1 GB RAM)
+if ! sudo swapon --show | grep -q swapfile; then
+  echo ">> Creating 2G swapfile..."
+  sudo fallocate -l 2G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  echo "/swapfile swap swap defaults 0 0" | sudo tee -a /etc/fstab >/dev/null
+fi
+
+# Nginx
+sudo apt-get install -y nginx
+
+# PHP 8.1 (Ondrej PPA)
+sudo add-apt-repository ppa:ondrej/php -y
+sudo apt-get update -y
+sudo apt-get install -y \
+  php8.1 php8.1-fpm php8.1-cli php8.1-common php8.1-mysql php8.1-xml php8.1-mbstring \
+  php8.1-curl php8.1-zip php8.1-bcmath
+
+# Composer
+if ! command -v composer >/dev/null 2>&1; then
+  EXPECTED_CHECKSUM="$(curl -s https://composer.github.io/installer.sig)"
+  php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+  php -r "if (hash_file('sha384', 'composer-setup.php') !== '$EXPECTED_CHECKSUM') { echo 'Composer installer corrupt'; unlink('composer-setup.php'); exit(1); }"
+  sudo php composer-setup.php --install-dir=/usr/local/bin --filename=composer
+  rm -f composer-setup.php
+fi
+
+# MariaDB
+sudo apt-get install -y mariadb-server
+sudo systemctl enable --now mariadb
+
+# Create DB + user
+echo ">> Creating database and user..."
+sudo mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+sudo mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+sudo mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost'; FLUSH PRIVILEGES;"
+
+# Fetch app
+sudo mkdir -p /var/www
+cd /var/www
+if [ ! -d lakasir ]; then
+  sudo git clone https://github.com/lakasir/lakasir.git
+fi
+sudo chown -R "$USER":"$USER" lakasir
+cd lakasir
+
+# Install PHP deps (swap prevents OOM)
+composer install --no-dev --optimize-autoloader
+
+# .env
+if [ ! -f .env ]; then
+  cp .env.example .env
+fi
+
+# Set APP_URL if domain provided
+APP_URL_LINE="APP_URL="
+if [ -n "$MY_DOMAIN" ]; then
+  APP_URL_LINE="APP_URL=https://${MY_DOMAIN}"
+fi
+
+# Write DB config into .env
+php -r '
+$env = file_get_contents(".env");
+function set_kv($s,$k,$v){return preg_match("/^".$k."=/m",$s)?preg_replace("/^".$k."=.*/m",$k."=".$v,$s):($s.PHP_EOL.$k."=".$v.PHP_EOL);}
+$env = set_kv($env,"'"${APP_URL_LINE%%=*}"'","'"${APP_URL_LINE#*=}"'");
+$env = set_kv($env,"DB_CONNECTION","mysql");
+$env = set_kv($env,"DB_HOST","127.0.0.1");
+$env = set_kv($env,"DB_PORT","3306");
+$env = set_kv($env,"DB_DATABASE","'"$DB_NAME"'");
+$env = set_kv($env,"DB_USERNAME","'"$DB_USER"'");
+$env = set_kv($env,"DB_PASSWORD","'"$DB_PASS"'");
+file_put_contents(".env",$env);
+'
+
+# Laravel app key
+php artisan key:generate
+
+# Storage symlink
+php artisan storage:link || true
+
+# Migrate (tenant path) + seed as per official guide
+php artisan migrate --path=database/migrations/tenant --seed --force
+
+# Publish Filament & Livewire assets (no Node/JS build needed per your choice)
+php artisan filament:assets
+php artisan livewire:publish --assets
+
+# Permissions for web user
+sudo chown -R www-data:www-data /var/www/lakasir
+sudo find /var/www/lakasir/storage -type d -exec chmod 775 {} \;
+sudo find /var/www/lakasir/bootstrap/cache -type d -exec chmod 775 {} \;
+
+# Nginx vhost
+SERVER_NAME_VALUE="_"
+if [ -n "$MY_DOMAIN" ]; then SERVER_NAME_VALUE="$MY_DOMAIN"; fi
+
+sudo bash -c "cat >/etc/nginx/sites-available/lakasir.conf" <<NGX
+server {
+    listen 80;
+    server_name ${SERVER_NAME_VALUE};
+
+    root /var/www/lakasir/public;
+    index index.php index.html;
+
+    client_max_body_size 20m;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$query_string;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.1-fpm.sock;
+        fastcgi_read_timeout 180s;
+    }
+
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {
+        expires 7d;
+        access_log off;
+    }
+}
+NGX
+
+sudo ln -sf /etc/nginx/sites-available/lakasir.conf /etc/nginx/sites-enabled/lakasir.conf
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl restart nginx php8.1-fpm
+
+# UFW (firewall)
+if command -v ufw >/dev/null 2>&1; then
+  sudo ufw allow OpenSSH || true
+  sudo ufw allow 'Nginx Full' || true
+  yes | sudo ufw enable || true
+fi
+
+# Laravel scheduler via www-data
+( crontab -u www-data -l 2>/dev/null | grep -v 'schedule:run' ; echo "* * * * * cd /var/www/lakasir && php artisan schedule:run >> /dev/null 2>&1" ) | sudo crontab -u www-data -
+
+echo "====================================================="
+echo " Lakasir install complete."
+echo " URL: http://${MY_DOMAIN:-<YOUR_SERVER_IP>}"
+echo " DB:  ${DB_NAME} (user ${DB_USER})"
+echo " Path: /var/www/lakasir"
+echo " Tip: Add HTTPS with certbot once DNS is ready."
+echo "====================================================="
+EOF
+
+chmod +x install_lakasir.sh
+# Optionally set your values inline (example):
+# DB_PASS='StrongPass!234' MY_DOMAIN='pos.example.com' ./install_lakasir.sh
+./install_lakasir.sh
